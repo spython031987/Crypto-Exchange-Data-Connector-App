@@ -1,31 +1,36 @@
 """
-Unified Crypto Market Data Gateway — Streamlit Community Cloud edition
-======================================================================
-Same architecture as the PoC:
-  - WebSocket connectors to Binance, Coinbase Exchange, and Kraken
-  - Normalization into a single internal schema (Trade, BBO)
-  - Thread-safe in-memory store fed by background threads
-  - Live dashboard
+Unified Crypto Market Data Gateway — v2
+=======================================
+v2 adds a real L2 order book maintainer for Binance (BTCUSDT, ETHUSDT)
+implementing Binance's documented synchronization protocol:
 
-Cloud-specific hardening vs the Colab version:
-  - Threads are owned by an @st.cache_resource singleton so they survive
-    Streamlit script reruns (which happen on every UI interaction and
-    auto-refresh tick).
-  - Threads are daemon=True so they die cleanly when the container restarts.
-  - Reconnect loop has bounded exponential backoff and watches a stop event.
-  - No ngrok, no pyngrok, no Colab. Streamlit Cloud handles hosting.
+  1. Subscribe to <symbol>@depth@100ms diff stream and BUFFER events.
+  2. Fetch REST snapshot at /api/v3/depth?limit=1000 (has `lastUpdateId`).
+  3. Drop buffered events where u <= lastUpdateId.
+  4. Verify the first remaining event satisfies U <= lastUpdateId+1 <= u.
+     If not, snapshot is stale — refetch.
+  5. Load snapshot into the book, replay surviving buffered events.
+  6. Go LIVE. For each new event, check U == prev_u + 1; on mismatch,
+     declare a GAP and resync from step 1.
+
+This protocol — buffer-while-fetching, sequence validation, gap detection,
+and recovery — is the "hard problem" the job description is hinting at.
+The dashboard visualizes it directly: ladder, depth chart, book health
+counters, and a live event log of the maintainer's transitions.
 """
 
 import json
 import threading
 import time
+import urllib.request
+import urllib.error
 from collections import deque
 from dataclasses import asdict, dataclass
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import websocket  # from `websocket-client` package
+import websocket
 from streamlit_autorefresh import st_autorefresh
 
 # --------------------------------------------------------------------------- #
@@ -40,11 +45,17 @@ SYMBOL_MAP = {
     "kraken":   {"BTC-USD": "XBT/USD", "ETH-USD": "ETH/USD"},
 }
 
+# Which (venue, symbol) pairs run a full L2 maintainer
+L2_TARGETS = [("binance", "BTC-USD"), ("binance", "ETH-USD")]
+
+LADDER_DEPTH = 20            # levels per side shown in the dashboard
 MAX_TRADES_BUFFER = 1000
+MAX_EVENT_LOG = 200
+MAX_BUFFER_EVENTS = 5000     # cap on per-symbol pending event buffer
 REFRESH_INTERVAL_MS = 1000
 
 # --------------------------------------------------------------------------- #
-# Unified normalized schema
+# Normalized schema
 # --------------------------------------------------------------------------- #
 @dataclass
 class Trade:
@@ -52,9 +63,9 @@ class Trade:
     symbol: str
     price: float
     qty: float
-    side: str            # "buy" or "sell" — taker side
-    exchange_ts: float   # ms since epoch, as reported by venue
-    ingest_ts: float     # ms since epoch, when we received it
+    side: str
+    exchange_ts: float
+    ingest_ts: float
     trade_id: str = ""
 
 
@@ -71,46 +82,317 @@ class BBO:
 
 
 # --------------------------------------------------------------------------- #
-# Thread-safe shared data store
+# L2 Order Book
+# --------------------------------------------------------------------------- #
+class OrderBook:
+    """Plain price->qty maps with sort-on-read. Fine for PoC scale (~hundreds
+    of mutations per second, ~1Hz render). Production would use SortedDict."""
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
+        self.last_event_ts: float = 0.0     # exchange time (ms) of last applied event
+        self.last_apply_ts: float = 0.0     # our wall clock (ms) of last apply
+
+    def load_snapshot(self, bids, asks) -> None:
+        self.bids = {float(p): float(q) for p, q in bids if float(q) > 0}
+        self.asks = {float(p): float(q) for p, q in asks if float(q) > 0}
+        self.last_apply_ts = time.time() * 1000.0
+
+    def apply_diff(self, bid_updates, ask_updates, exchange_ts: float) -> None:
+        for p_str, q_str in bid_updates:
+            p, q = float(p_str), float(q_str)
+            if q == 0:
+                self.bids.pop(p, None)
+            else:
+                self.bids[p] = q
+        for p_str, q_str in ask_updates:
+            p, q = float(p_str), float(q_str)
+            if q == 0:
+                self.asks.pop(p, None)
+            else:
+                self.asks[p] = q
+        self.last_event_ts = exchange_ts
+        self.last_apply_ts = time.time() * 1000.0
+
+    def top_n(self, n: int = LADDER_DEPTH):
+        bids = sorted(self.bids.items(), key=lambda kv: -kv[0])[:n]
+        asks = sorted(self.asks.items(), key=lambda kv:  kv[0])[:n]
+        return bids, asks
+
+    def bbo(self):
+        if not self.bids or not self.asks:
+            return None
+        bb = max(self.bids); ba = min(self.asks)
+        return bb, self.bids[bb], ba, self.asks[ba]
+
+
+# --------------------------------------------------------------------------- #
+# L2 Book Maintainer (Binance synchronization protocol)
+# --------------------------------------------------------------------------- #
+class L2BookMaintainer:
+    """One instance per (venue, symbol). Implements Binance's documented
+    diff-depth synchronization protocol with gap detection and resnapshot."""
+
+    REST_URL = "https://api.binance.com/api/v3/depth?symbol={}&limit=1000"
+
+    # States: INIT -> BUFFERING -> SYNCING -> LIVE
+    #         LIVE -> RESYNC -> SYNCING -> LIVE
+    def __init__(self, store: "DataStore", venue: str, symbol_canonical: str,
+                 symbol_native: str):
+        self.store = store
+        self.venue = venue
+        self.symbol = symbol_canonical
+        self.native = symbol_native            # "btcusdt"
+        self.rest_sym = symbol_native.upper()  # "BTCUSDT"
+        self.book = OrderBook(symbol_canonical)
+
+        self.state = "INIT"
+        self.buffer: deque = deque(maxlen=MAX_BUFFER_EVENTS)
+        self.last_u: int = 0
+        self.gaps_detected = 0
+        self.resnapshots = 0
+        self.events_applied = 0
+        self.buffer_overflows = 0
+        self.lock = threading.Lock()
+
+    # --- inbound from WebSocket --------------------------------------------- #
+    def on_event(self, event: dict) -> None:
+        """event has keys U (first update id), u (final update id),
+        b (bid updates), a (ask updates), E (event time)."""
+        with self.lock:
+            if self.state == "INIT":
+                self.state = "BUFFERING"
+                pre_len = len(self.buffer)
+                self.buffer.append(event)
+                if pre_len == MAX_BUFFER_EVENTS:
+                    self.buffer_overflows += 1
+                self.store.log("INFO", self.venue, self.symbol,
+                               f"First depth event received (U={event['U']}, "
+                               f"u={event['u']}). Starting initial sync.")
+                self._spawn_resync()
+                return
+
+            if self.state in ("BUFFERING", "SYNCING", "RESYNC"):
+                pre_len = len(self.buffer)
+                self.buffer.append(event)
+                if pre_len == MAX_BUFFER_EVENTS:
+                    self.buffer_overflows += 1
+                    self.store.log("WARN", self.venue, self.symbol,
+                                   "Buffer overflow — oldest event dropped.")
+                return
+
+            if self.state == "LIVE":
+                if event["U"] != self.last_u + 1:
+                    # GAP. Binance contract: each event's U must equal previous u+1.
+                    self.gaps_detected += 1
+                    self.store.log(
+                        "WARN", self.venue, self.symbol,
+                        f"Sequence gap — expected U={self.last_u + 1}, "
+                        f"got U={event['U']} (Δ={event['U'] - self.last_u - 1}). "
+                        f"Triggering resnapshot."
+                    )
+                    self.state = "RESYNC"
+                    self.buffer.clear()
+                    self.buffer.append(event)
+                    self._spawn_resync()
+                    return
+
+                self.book.apply_diff(event["b"], event["a"],
+                                     exchange_ts=float(event.get("E", 0)))
+                self.last_u = event["u"]
+                self.events_applied += 1
+                self._publish_top_of_book()
+
+    # --- snapshot fetch + replay ------------------------------------------- #
+    def _spawn_resync(self) -> None:
+        threading.Thread(target=self._fetch_and_replay, daemon=True,
+                         name=f"l2-resync-{self.venue}-{self.symbol}").start()
+
+    def _fetch_and_replay(self) -> None:
+        self.store.log("INFO", self.venue, self.symbol,
+                       f"Fetching REST snapshot for {self.rest_sym}…")
+        try:
+            url = self.REST_URL.format(self.rest_sym)
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "crypto-gateway-poc/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                snap = json.loads(resp.read())
+        except Exception as e:
+            self.store.log("ERROR", self.venue, self.symbol,
+                           f"Snapshot fetch failed: {type(e).__name__}: {e}. "
+                           f"Retrying in 2s.")
+            threading.Timer(2.0, self._spawn_resync).start()
+            return
+
+        snap_id = int(snap["lastUpdateId"])
+
+        with self.lock:
+            self.state = "SYNCING"
+            self.store.log("INFO", self.venue, self.symbol,
+                           f"Snapshot received (lastUpdateId={snap_id}, "
+                           f"{len(snap['bids'])} bids / {len(snap['asks'])} asks). "
+                           f"Buffer holds {len(self.buffer)} events.")
+
+            # Drop buffered events that are already in the snapshot
+            usable = [e for e in self.buffer if e["u"] > snap_id]
+
+            if not usable:
+                # No usable events yet — load snapshot, wait for live events
+                self.book.load_snapshot(snap["bids"], snap["asks"])
+                self.last_u = snap_id
+                self.buffer.clear()
+                self.state = "LIVE"
+                self.resnapshots += 1
+                self.store.log("INFO", self.venue, self.symbol,
+                               "Snapshot loaded. No buffered events to replay. "
+                               "State → LIVE.")
+                self._publish_top_of_book()
+                return
+
+            first = usable[0]
+            # Binance contract: first event after snapshot must straddle snap_id+1
+            if not (first["U"] <= snap_id + 1 <= first["u"]):
+                self.store.log(
+                    "WARN", self.venue, self.symbol,
+                    f"Snapshot is stale (snap={snap_id}, first_buffered "
+                    f"event U={first['U']}, u={first['u']}). Refetching."
+                )
+                self.state = "RESYNC"
+                threading.Timer(1.0, self._spawn_resync).start()
+                return
+
+            # Load snapshot, replay events strictly after snap_id
+            self.book.load_snapshot(snap["bids"], snap["asks"])
+            applied = 0
+            prev_u = snap_id
+            for ev in usable:
+                if ev["u"] <= snap_id:
+                    continue
+                # Check intra-buffer continuity (except for the first replayed)
+                if applied > 0 and ev["U"] != prev_u + 1:
+                    self.store.log(
+                        "WARN", self.venue, self.symbol,
+                        f"Gap in buffered events during replay "
+                        f"(expected U={prev_u + 1}, got U={ev['U']}). "
+                        f"Restarting sync."
+                    )
+                    self.state = "RESYNC"
+                    threading.Timer(1.0, self._spawn_resync).start()
+                    return
+                self.book.apply_diff(ev["b"], ev["a"],
+                                     exchange_ts=float(ev.get("E", 0)))
+                prev_u = ev["u"]
+                applied += 1
+
+            self.last_u = prev_u
+            self.events_applied += applied
+            self.buffer.clear()
+            self.state = "LIVE"
+            self.resnapshots += 1
+            self.store.log("INFO", self.venue, self.symbol,
+                           f"Replayed {applied} buffered events. State → LIVE. "
+                           f"last_u={self.last_u}.")
+            self._publish_top_of_book()
+
+    def _publish_top_of_book(self) -> None:
+        b = self.book.bbo()
+        if b is None:
+            return
+        bb, bb_sz, ba, ba_sz = b
+        now = time.time() * 1000.0
+        self.store.set_bbo(BBO(
+            venue=self.venue, symbol=self.symbol,
+            bid=bb, bid_size=bb_sz, ask=ba, ask_size=ba_sz,
+            exchange_ts=self.book.last_event_ts or now,
+            ingest_ts=now,
+        ))
+
+    # --- snapshot for dashboard -------------------------------------------- #
+    def snapshot(self) -> dict:
+        with self.lock:
+            bids, asks = self.book.top_n(LADDER_DEPTH)
+            now = time.time() * 1000.0
+            return {
+                "state": self.state,
+                "bids": bids,
+                "asks": asks,
+                "last_u": self.last_u,
+                "gaps_detected": self.gaps_detected,
+                "resnapshots": self.resnapshots,
+                "events_applied": self.events_applied,
+                "buffer_size": len(self.buffer),
+                "buffer_overflows": self.buffer_overflows,
+                "n_bid_levels": len(self.book.bids),
+                "n_ask_levels": len(self.book.asks),
+                "book_age_ms": (now - self.book.last_apply_ts
+                                if self.book.last_apply_ts else None),
+            }
+
+
+# --------------------------------------------------------------------------- #
+# DataStore — shared between background threads and Streamlit
 # --------------------------------------------------------------------------- #
 class DataStore:
-    def __init__(self, max_trades: int = MAX_TRADES_BUFFER):
-        self.trades: deque = deque(maxlen=max_trades)
-        self.bbo: dict = {}  # (venue, symbol) -> BBO
+    def __init__(self):
+        self.trades: deque = deque(maxlen=MAX_TRADES_BUFFER)
+        self.bbo: dict = {}
         self.lock = threading.Lock()
         self.health = {
-            v: {"connected": False, "messages": 0, "errors": 0,
-                "last_msg_ts": 0.0, "started_ts": 0.0}
+            v: {"connected": False, "messages": 0,
+                "transport_errors": 0, "parse_errors": 0,
+                "last_msg_ts": 0.0}
             for v in VENUES
         }
+        self.events: deque = deque(maxlen=MAX_EVENT_LOG)
+        self.event_lock = threading.Lock()
+        self.l2: dict = {}  # (venue, symbol) -> L2BookMaintainer
+        for venue, sym in L2_TARGETS:
+            native = SYMBOL_MAP[venue][sym]
+            self.l2[(venue, sym)] = L2BookMaintainer(self, venue, sym, native)
         self.stop_event = threading.Event()
         self._started = False
-        self._threads: list = []
 
-    # ---- mutators (called from WebSocket threads) ------------------------- #
-    def add_trade(self, trade: Trade) -> None:
+    # --- trade / bbo / health (mutators) ----------------------------------- #
+    def add_trade(self, t: Trade) -> None:
         with self.lock:
-            self.trades.append(trade)
-            h = self.health[trade.venue]
+            self.trades.append(t)
+            h = self.health[t.venue]
             h["messages"] += 1
-            h["last_msg_ts"] = trade.ingest_ts
+            h["last_msg_ts"] = t.ingest_ts
 
-    def set_bbo(self, bbo: BBO) -> None:
+    def set_bbo(self, b: BBO) -> None:
         with self.lock:
-            self.bbo[(bbo.venue, bbo.symbol)] = bbo
-            h = self.health[bbo.venue]
+            self.bbo[(b.venue, b.symbol)] = b
+            h = self.health[b.venue]
             h["messages"] += 1
-            h["last_msg_ts"] = bbo.ingest_ts
+            h["last_msg_ts"] = b.ingest_ts
 
-    def record_error(self, venue: str) -> None:
+    def record_transport_error(self, venue: str) -> None:
         with self.lock:
-            self.health[venue]["errors"] += 1
+            self.health[venue]["transport_errors"] += 1
+
+    def record_parse_error(self, venue: str) -> None:
+        with self.lock:
+            self.health[venue]["parse_errors"] += 1
 
     def set_connected(self, venue: str, connected: bool) -> None:
         with self.lock:
             self.health[venue]["connected"] = connected
 
-    # ---- snapshots (called from Streamlit's render thread) ---------------- #
+    # --- event log --------------------------------------------------------- #
+    def log(self, level: str, venue: str, symbol: str, msg: str) -> None:
+        with self.event_lock:
+            self.events.append({
+                "ts": time.time() * 1000.0,
+                "level": level,
+                "venue": venue,
+                "symbol": symbol,
+                "msg": msg,
+            })
+
+    # --- snapshots (readers) ----------------------------------------------- #
     def snapshot_trades(self) -> pd.DataFrame:
         with self.lock:
             if not self.trades:
@@ -127,23 +409,26 @@ class DataStore:
         with self.lock:
             return {v: dict(h) for v, h in self.health.items()}
 
-    # ---- lifecycle -------------------------------------------------------- #
+    def snapshot_events(self, n: int = 40) -> list:
+        with self.event_lock:
+            return list(self.events)[-n:][::-1]
+
+    def get_l2(self, venue: str, symbol: str) -> L2BookMaintainer | None:
+        return self.l2.get((venue, symbol))
+
+    # --- lifecycle --------------------------------------------------------- #
     def start(self) -> None:
         if self._started:
             return
         self._started = True
-        now = _now_ms()
-        for v in VENUES:
-            self.health[v]["started_ts"] = now
         for fn in (run_binance, run_coinbase, run_kraken):
             t = threading.Thread(target=fn, args=(self,), daemon=True,
                                  name=f"ws-{fn.__name__}")
             t.start()
-            self._threads.append(t)
 
 
 # --------------------------------------------------------------------------- #
-# WebSocket clients (one per venue), with auto-reconnect
+# WebSocket clients
 # --------------------------------------------------------------------------- #
 def _now_ms() -> float:
     return time.time() * 1000.0
@@ -156,13 +441,15 @@ def _reverse_symbol(venue: str, native: str) -> str:
     return native
 
 
-# ------ Binance ------------------------------------------------------------ #
+# ------ Binance: trade + bookTicker + depth -------------------------------- #
 def run_binance(store: DataStore) -> None:
     streams = []
     for sym in SYMBOLS:
         ns = SYMBOL_MAP["binance"][sym]
         streams.append(f"{ns}@trade")
         streams.append(f"{ns}@bookTicker")
+        if ("binance", sym) in L2_TARGETS:
+            streams.append(f"{ns}@depth@100ms")
     url = "wss://stream.binance.com:9443/stream?streams=" + "/".join(streams)
 
     def on_message(_ws, raw: str) -> None:
@@ -177,11 +464,9 @@ def run_binance(store: DataStore) -> None:
                 store.add_trade(Trade(
                     venue="binance",
                     symbol=_reverse_symbol("binance", native),
-                    price=float(data["p"]),
-                    qty=float(data["q"]),
+                    price=float(data["p"]), qty=float(data["q"]),
                     side="sell" if data.get("m") else "buy",
-                    exchange_ts=float(data["T"]),
-                    ingest_ts=ingest,
+                    exchange_ts=float(data["T"]), ingest_ts=ingest,
                     trade_id=str(data.get("t", "")),
                 ))
             elif "@bookTicker" in stream:
@@ -189,19 +474,28 @@ def run_binance(store: DataStore) -> None:
                 store.set_bbo(BBO(
                     venue="binance",
                     symbol=_reverse_symbol("binance", native),
-                    bid=float(data["b"]),
-                    bid_size=float(data["B"]),
-                    ask=float(data["a"]),
-                    ask_size=float(data["A"]),
-                    exchange_ts=ingest,
-                    ingest_ts=ingest,
+                    bid=float(data["b"]), bid_size=float(data["B"]),
+                    ask=float(data["a"]), ask_size=float(data["A"]),
+                    exchange_ts=ingest, ingest_ts=ingest,
                 ))
+            elif "@depth" in stream:
+                native = stream.split("@")[0]
+                sym = _reverse_symbol("binance", native)
+                maintainer = store.get_l2("binance", sym)
+                if maintainer is not None:
+                    maintainer.on_event(data)
         except Exception:
-            store.record_error("binance")
+            store.record_parse_error("binance")
 
-    def on_open(_ws):  store.set_connected("binance", True)
-    def on_close(_ws, *_a): store.set_connected("binance", False)
-    def on_error(_ws, _e):  store.record_error("binance")
+    def on_open(_ws):
+        store.set_connected("binance", True)
+        store.log("INFO", "binance", "*", "WebSocket connected.")
+    def on_close(_ws, *_a):
+        store.set_connected("binance", False)
+        store.log("WARN", "binance", "*", "WebSocket disconnected.")
+    def on_error(_ws, e):
+        store.record_transport_error("binance")
+        store.log("ERROR", "binance", "*", f"WebSocket error: {e}")
 
     _run_forever_with_backoff(url, on_message, on_open, on_close, on_error,
                               store, "binance")
@@ -247,14 +541,18 @@ def run_coinbase(store: DataStore) -> None:
                     exchange_ts=ex_ts, ingest_ts=ingest,
                 ))
         except Exception:
-            store.record_error("coinbase")
+            store.record_parse_error("coinbase")
 
     def on_open(ws):
         store.set_connected("coinbase", True)
+        store.log("INFO", "coinbase", "*", "WebSocket connected, subscribing.")
         ws.send(json.dumps(subscribe))
-
-    def on_close(_ws, *_a): store.set_connected("coinbase", False)
-    def on_error(_ws, _e):  store.record_error("coinbase")
+    def on_close(_ws, *_a):
+        store.set_connected("coinbase", False)
+        store.log("WARN", "coinbase", "*", "WebSocket disconnected.")
+    def on_error(_ws, e):
+        store.record_transport_error("coinbase")
+        store.log("ERROR", "coinbase", "*", f"WebSocket error: {e}")
 
     _run_forever_with_backoff(url, on_message, on_open, on_close, on_error,
                               store, "coinbase")
@@ -293,17 +591,21 @@ def run_kraken(store: DataStore) -> None:
                         ingest_ts=ingest,
                     ))
         except Exception:
-            store.record_error("kraken")
+            store.record_parse_error("kraken")
 
     def on_open(ws):
         store.set_connected("kraken", True)
+        store.log("INFO", "kraken", "*", "WebSocket connected, subscribing.")
         ws.send(json.dumps({"event": "subscribe", "pair": pairs,
                             "subscription": {"name": "trade"}}))
         ws.send(json.dumps({"event": "subscribe", "pair": pairs,
                             "subscription": {"name": "spread"}}))
-
-    def on_close(_ws, *_a): store.set_connected("kraken", False)
-    def on_error(_ws, _e):  store.record_error("kraken")
+    def on_close(_ws, *_a):
+        store.set_connected("kraken", False)
+        store.log("WARN", "kraken", "*", "WebSocket disconnected.")
+    def on_error(_ws, e):
+        store.record_transport_error("kraken")
+        store.log("ERROR", "kraken", "*", f"WebSocket error: {e}")
 
     _run_forever_with_backoff(url, on_message, on_open, on_close, on_error,
                               store, "kraken")
@@ -311,21 +613,17 @@ def run_kraken(store: DataStore) -> None:
 
 def _run_forever_with_backoff(url, on_message, on_open, on_close, on_error,
                               store, venue):
-    """Reconnect loop with bounded exponential backoff."""
     backoff = 1.0
     while not store.stop_event.is_set():
         try:
             ws = websocket.WebSocketApp(
-                url,
-                on_message=on_message,
-                on_open=on_open,
-                on_close=on_close,
-                on_error=on_error,
+                url, on_message=on_message, on_open=on_open,
+                on_close=on_close, on_error=on_error,
             )
             ws.run_forever(ping_interval=20, ping_timeout=10)
-            backoff = 1.0  # reset after a clean disconnect
+            backoff = 1.0
         except Exception:
-            store.record_error(venue)
+            store.record_transport_error(venue)
         store.set_connected(venue, False)
         if store.stop_event.is_set():
             return
@@ -334,9 +632,9 @@ def _run_forever_with_backoff(url, on_message, on_open, on_close, on_error,
 
 
 # --------------------------------------------------------------------------- #
-# Streamlit cached singleton — survives reruns
+# Streamlit cached singleton
 # --------------------------------------------------------------------------- #
-@st.cache_resource(show_spinner="Starting WebSocket connectors…")
+@st.cache_resource(show_spinner="Starting WebSocket connectors and L2 maintainers…")
 def get_store() -> DataStore:
     store = DataStore()
     store.start()
@@ -346,15 +644,13 @@ def get_store() -> DataStore:
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
-st.set_page_config(
-    page_title="Crypto Market Data Gateway — PoC",
-    page_icon="🪙",
-    layout="wide",
-)
-st.title("🪙 Unified Crypto Market Data Gateway — PoC")
+st.set_page_config(page_title="Crypto Market Data Gateway — v2",
+                   page_icon="🪙", layout="wide")
+st.title("🪙 Unified Crypto Market Data Gateway — v2")
 st.caption(
-    "Live normalized WebSocket feeds from Binance, Coinbase, and Kraken, "
-    "mapped into a single internal schema. Hosted on Streamlit Community Cloud."
+    "Live normalized feeds from Binance, Coinbase, and Kraken, plus a real "
+    "L2 order book maintainer for Binance with sequence-gap detection and "
+    "resnapshot recovery."
 )
 
 store = get_store()
@@ -363,32 +659,34 @@ st_autorefresh(interval=REFRESH_INTERVAL_MS, key="autorefresh")
 # ------ Sidebar: controls + feed health ----------------------------------- #
 with st.sidebar:
     st.header("Controls")
-    selected_symbol = st.selectbox("Symbol", SYMBOLS, index=0)
+    selected_symbol = st.selectbox("Symbol (cross-venue panels)", SYMBOLS, index=0)
+    l2_symbol = st.selectbox("L2 book symbol (Binance)", SYMBOLS, index=0)
 
     st.header("Feed health")
     health = store.snapshot_health()
     now = _now_ms()
     for venue, h in health.items():
         dot = "🟢" if h["connected"] else "🔴"
-        if h["last_msg_ts"]:
-            age_txt = f"{(now - h['last_msg_ts']) / 1000.0:.1f}s ago"
-        else:
-            age_txt = "no data yet"
+        age_txt = (f"{(now - h['last_msg_ts']) / 1000.0:.1f}s ago"
+                   if h["last_msg_ts"] else "no data yet")
         st.markdown(
-            f"{dot} **{venue}** &nbsp; "
-            f"`{h['messages']:,}` msgs &nbsp;|&nbsp; "
-            f"last: {age_txt} &nbsp;|&nbsp; "
-            f"errors: {h['errors']}"
+            f"{dot} **{venue}** &nbsp; `{h['messages']:,}` msgs<br>"
+            f"&nbsp;&nbsp;last: {age_txt}<br>"
+            f"&nbsp;&nbsp;transport err: {h['transport_errors']} &nbsp;|&nbsp; "
+            f"parse err: {h['parse_errors']}",
+            unsafe_allow_html=True,
         )
 
     st.divider()
     st.caption(
-        "Replacing one connector or adding a venue should not require any "
-        "change to the dashboard or downstream consumers. That's the test "
-        "of the normalization layer."
+        "**transport_errors**: WebSocket-level failures (connection drops, "
+        "TLS errors).&nbsp; **parse_errors**: exceptions inside our message "
+        "handlers (unknown shape, type mismatch). Slow rise on parse_errors "
+        "is usually benign — heartbeats and subscription acks fall through."
     )
 
-# ------ Main: BBO + trade tape -------------------------------------------- #
+# ===== Section 1: cross-venue BBO + trade tape ============================ #
+st.header("Cross-venue view")
 col_left, col_right = st.columns([2, 3])
 
 with col_left:
@@ -408,15 +706,12 @@ with col_left:
                  "spread_bps": 2, "latency_ms": 1}),
             use_container_width=True, hide_index=True,
         )
-
         best_bid = bbo_df.loc[bbo_df["bid"].idxmax()]
         best_ask = bbo_df.loc[bbo_df["ask"].idxmin()]
         x_bps = (best_bid["bid"] - best_ask["ask"]) / best_ask["ask"] * 1e4
         m1, m2, m3 = st.columns(3)
-        m1.metric("Best bid (across venues)",
-                  f"${best_bid['bid']:,.2f}", f"@ {best_bid['venue']}")
-        m2.metric("Best ask (across venues)",
-                  f"${best_ask['ask']:,.2f}", f"@ {best_ask['venue']}")
+        m1.metric("Best bid", f"${best_bid['bid']:,.2f}", f"@ {best_bid['venue']}")
+        m2.metric("Best ask", f"${best_ask['ask']:,.2f}", f"@ {best_ask['venue']}")
         m3.metric("Cross-venue spread", f"{x_bps:+.2f} bps")
 
 with col_right:
@@ -437,7 +732,118 @@ with col_right:
             use_container_width=True, hide_index=True,
         )
 
-# ------ Price chart across venues ----------------------------------------- #
+st.divider()
+
+# ===== Section 2: L2 order book =========================================== #
+st.header(f"📊 L2 order book — Binance {l2_symbol}")
+maintainer = store.get_l2("binance", l2_symbol)
+snap = maintainer.snapshot() if maintainer else None
+
+if not snap:
+    st.info("No L2 maintainer for this symbol.")
+else:
+    # Book health card
+    state_color = {
+        "INIT": "🟡", "BUFFERING": "🟡", "SYNCING": "🟡",
+        "LIVE": "🟢", "RESYNC": "🔴",
+    }.get(snap["state"], "⚪")
+    book_age = (f"{snap['book_age_ms']:.0f} ms"
+                if snap["book_age_ms"] is not None else "—")
+
+    h1, h2, h3, h4, h5, h6 = st.columns(6)
+    h1.metric("State", f"{state_color} {snap['state']}")
+    h2.metric("Gaps detected", snap["gaps_detected"])
+    h3.metric("Resnapshots", snap["resnapshots"])
+    h4.metric("Events applied", f"{snap['events_applied']:,}")
+    h5.metric("Levels (bid/ask)",
+              f"{snap['n_bid_levels']}/{snap['n_ask_levels']}")
+    h6.metric("Book age", book_age)
+
+    # Ladder + depth chart
+    book_l, book_r = st.columns([1, 1])
+
+    with book_l:
+        st.markdown("**Ladder (top 20 each side)**")
+        if not snap["bids"] or not snap["asks"]:
+            st.info("Book not yet populated — waiting for sync to complete…")
+        else:
+            # Ladder as one combined frame, asks descending top, then bids descending
+            asks_df = pd.DataFrame(snap["asks"], columns=["price", "qty"])
+            asks_df["side"] = "ask"
+            bids_df = pd.DataFrame(snap["bids"], columns=["price", "qty"])
+            bids_df["side"] = "bid"
+            # Asks: highest at top → reverse order
+            asks_df = asks_df.iloc[::-1].reset_index(drop=True)
+            ladder = pd.concat([asks_df, bids_df], ignore_index=True)
+            ladder["price"] = ladder["price"].round(2)
+            ladder["qty"] = ladder["qty"].round(5)
+            # Pretty: use color-coded "qty bar" emoji-ish — keep numeric for clarity
+            max_qty = max(ladder["qty"].max(), 1e-9)
+            ladder["depth"] = ladder["qty"].apply(
+                lambda q: "▰" * int(round(q / max_qty * 12)))
+            st.dataframe(
+                ladder[["side", "price", "qty", "depth"]],
+                use_container_width=True, hide_index=True, height=735,
+            )
+
+    with book_r:
+        st.markdown("**Depth chart (cumulative liquidity)**")
+        if not snap["bids"] or not snap["asks"]:
+            st.info("Waiting for book…")
+        else:
+            bids_df = pd.DataFrame(snap["bids"], columns=["price", "qty"])
+            asks_df = pd.DataFrame(snap["asks"], columns=["price", "qty"])
+            bids_df = bids_df.sort_values("price", ascending=False).reset_index(drop=True)
+            asks_df = asks_df.sort_values("price", ascending=True ).reset_index(drop=True)
+            bids_df["cum"] = bids_df["qty"].cumsum()
+            asks_df["cum"] = asks_df["qty"].cumsum()
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=bids_df["price"], y=bids_df["cum"], mode="lines",
+                line=dict(shape="hv", color="#26a69a", width=2),
+                fill="tozeroy", fillcolor="rgba(38,166,154,0.18)",
+                name="bids cum",
+            ))
+            fig.add_trace(go.Scatter(
+                x=asks_df["price"], y=asks_df["cum"], mode="lines",
+                line=dict(shape="hv", color="#ef5350", width=2),
+                fill="tozeroy", fillcolor="rgba(239,83,80,0.18)",
+                name="asks cum",
+            ))
+            fig.update_layout(
+                height=700, margin=dict(l=0, r=0, t=10, b=0),
+                xaxis_title="Price (USD)", yaxis_title="Cumulative size",
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ===== Section 3: live event log ========================================== #
+st.header("📜 Maintainer event log")
+events = store.snapshot_events(40)
+if not events:
+    st.info("No events yet.")
+else:
+    ev_df = pd.DataFrame(events)
+    ev_df["time"] = (pd.to_datetime(ev_df["ts"], unit="ms")
+                       .dt.strftime("%H:%M:%S.%f").str[:-3])
+    ev_df = ev_df[["time", "level", "venue", "symbol", "msg"]]
+    # color-code level (best effort via st.dataframe formatter)
+    def _row_style(row):
+        color = {"INFO": "", "WARN": "color: #f9a825;",
+                 "ERROR": "color: #ef5350;"}.get(row["level"], "")
+        return [color] * len(row)
+    try:
+        styled = ev_df.style.apply(_row_style, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=420)
+    except Exception:
+        st.dataframe(ev_df, use_container_width=True, hide_index=True, height=420)
+
+st.divider()
+
+# ===== Section 4: legacy chart + latency =================================== #
 st.subheader(f"Recent trade prices across venues — {selected_symbol}")
 trades_all = store.snapshot_trades()
 if trades_all.empty:
@@ -456,14 +862,13 @@ else:
                 name=venue, marker=dict(size=4),
             ))
         fig.update_layout(
-            height=360, margin=dict(l=0, r=0, t=10, b=0),
+            height=320, margin=dict(l=0, r=0, t=10, b=0),
             xaxis_title="Exchange time", yaxis_title="Price (USD)",
             legend=dict(orientation="h", y=1.1),
         )
         st.plotly_chart(fig, use_container_width=True)
 
-# ------ Latency distribution ---------------------------------------------- #
-st.subheader("Ingest latency by venue (last 300 trades, all symbols)")
+st.subheader("Ingest latency by venue (last 300 trades)")
 if not trades_all.empty:
     recent = trades_all.tail(300).copy()
     recent["latency_ms"] = recent["ingest_ts"] - recent["exchange_ts"]
@@ -474,14 +879,14 @@ if not trades_all.empty:
             v = recent[recent["venue"] == venue]
             fig.add_trace(go.Box(y=v["latency_ms"], name=venue, boxpoints="outliers"))
         fig.update_layout(
-            height=280, yaxis_title="Latency (ms)",
+            height=260, yaxis_title="Latency (ms)",
             margin=dict(l=0, r=0, t=10, b=0),
         )
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Not enough latency samples yet…")
 
-# ------ Raw normalized JSON sample ---------------------------------------- #
+# Raw normalized JSON
 with st.expander("📦 Normalized JSON — what downstream clients would consume"):
     with store.lock:
         sample = [asdict(t) for t in list(store.trades)[-5:]]
@@ -489,11 +894,3 @@ with st.expander("📦 Normalized JSON — what downstream clients would consume
         st.code(json.dumps(sample, indent=2), language="json")
     else:
         st.write("_No trades yet._")
-
-st.divider()
-st.caption(
-    "Hosted on Streamlit Community Cloud. Latency reflects the Streamlit "
-    "Cloud VM's network path to each exchange — not a production system. "
-    "A real product would colocate ingestors in the same region as each "
-    "venue's matchers and use binary serialization."
-)
