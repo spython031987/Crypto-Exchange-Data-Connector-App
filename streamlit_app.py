@@ -531,12 +531,39 @@ def run_coinbase(store: DataStore):
         "channels": ["matches", "ticker", "level2_batch"],
     }
 
+    # Diagnostic: remember which message types we've already logged a
+    # "first sighting" for, so the event log shows each type exactly once.
+    seen_types: set = set()
+
     def on_message(_ws, raw):
+        data = None
         try:
-            data = json.loads(raw); ingest = _now_ms()
-            mtype = data.get("type"); product = data.get("product_id")
-            if not product and mtype not in ("subscriptions",): return
-            sym = _reverse_symbol("coinbase", product) if product else None
+            data = json.loads(raw)
+            ingest = _now_ms()
+            mtype = data.get("type")
+            product = data.get("product_id")
+
+            # --- DIAGNOSTIC: log the first time we ever see a message type.
+            # If 'snapshot' never appears here, Coinbase isn't sending it.
+            if mtype not in seen_types:
+                seen_types.add(mtype)
+                store.log("INFO", "coinbase", product or "*",
+                          f"First '{mtype}' message seen "
+                          f"(keys: {sorted(data.keys())})")
+
+            # --- DIAGNOSTIC: the subscriptions confirmation tells us exactly
+            # which channels Coinbase actually accepted. If 'level2_batch' is
+            # missing from this list, that is the whole problem.
+            if mtype == "subscriptions":
+                chans = data.get("channels", [])
+                names = [c.get("name") for c in chans if isinstance(c, dict)]
+                store.log("INFO", "coinbase", "*",
+                          f"Subscription confirmed for channels: {names}")
+                return
+
+            if not product:
+                return
+            sym = _reverse_symbol("coinbase", product)
 
             if mtype == "match":
                 ex_ts = pd.Timestamp(data["time"]).timestamp() * 1000.0
@@ -547,7 +574,6 @@ def run_coinbase(store: DataStore):
                     trade_id=str(data.get("trade_id", "")),
                 ))
             elif mtype == "ticker":
-                # Tiny BBO source while L2 syncs; gets overwritten by L2 top-of-book
                 ex_ts = pd.Timestamp(data["time"]).timestamp() * 1000.0 if "time" in data else ingest
                 store.set_bbo(BBO(
                     venue="coinbase", symbol=sym,
@@ -558,19 +584,35 @@ def run_coinbase(store: DataStore):
                     exchange_ts=ex_ts, ingest_ts=ingest,
                 ))
             elif mtype == "snapshot":
+                # DIAGNOSTIC: confirm the snapshot reached routing, with sizes
+                store.log("INFO", "coinbase", sym,
+                          f"Routing snapshot to maintainer "
+                          f"({len(data.get('bids', []))} bids / "
+                          f"{len(data.get('asks', []))} asks).")
                 m = store.get_l2("coinbase", sym)
-                if m: m.on_snapshot(data)
+                if m:
+                    m.on_snapshot(data)
+                else:
+                    store.log("WARN", "coinbase", sym,
+                              f"No L2 maintainer registered for sym={sym!r} — "
+                              f"snapshot dropped.")
             elif mtype == "l2update":
                 m = store.get_l2("coinbase", sym)
-                if m: m.on_l2update(data)
+                if m:
+                    m.on_l2update(data)
             elif mtype == "error":
-                # Surface subscription rejections (bad channel, auth required,
-                # unknown product) instead of failing silently.
                 store.log("ERROR", "coinbase", "*",
                           f"Subscription error: {data.get('message', '')} "
                           f"{data.get('reason', '')}".strip())
-        except Exception:
+        except Exception as e:
             store.record_parse_error("coinbase")
+            # DIAGNOSTIC: surface the actual exception instead of just bumping
+            # a silent counter. This is how a throwing on_snapshot becomes
+            # visible in the event log.
+            tp = data.get("type") if isinstance(data, dict) else "<json-parse-failed>"
+            store.log("ERROR", "coinbase", "*",
+                      f"Exception handling '{tp}' message: "
+                      f"{type(e).__name__}: {e}")
 
     def on_open(ws):
         store.set_connected("coinbase", True)
