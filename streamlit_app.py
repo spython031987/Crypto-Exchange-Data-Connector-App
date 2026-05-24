@@ -5,11 +5,13 @@ v3 dispenses with Binance L2 (Streamlit Cloud egress is blocked from
 Binance's REST snapshot endpoint) and instead demonstrates two different
 real-world L2 synchronization protocols on the venues that DO work:
 
-  - Coinbase (`level2` channel):
+  - Coinbase (`level2_batch` channel):
       Server pushes one `snapshot` message after subscribe, then streams
-      `l2update` messages. No sequence numbers — Coinbase guarantees
-      ordered delivery on the channel. Recovery on disconnect is simply
-      "wait for the new snapshot the server sends on resubscribe."
+      `l2update` messages batched every 50ms. No sequence numbers — Coinbase
+      guarantees ordered delivery on the channel. Recovery on disconnect is
+      simply "wait for the new snapshot the server sends on resubscribe."
+      (The plain `level2` channel requires authentication since 2023-08-01;
+      `level2_batch` is the public, unauthenticated equivalent.)
 
   - Kraken v1 (`book-25` channel):
       Server pushes an initial snapshot (`as`/`bs`), then streams updates
@@ -513,14 +515,20 @@ def run_binance(store: DataStore):
     _run_forever_with_backoff(url, on_message, on_open, on_close, on_error, store, "binance")
 
 
-# ------ Coinbase: matches + ticker + level2 -------------------------------- #
+# ------ Coinbase: matches + ticker + level2_batch -------------------------- #
+# NOTE: Coinbase Exchange has required AUTHENTICATION on the plain `level2`
+# channel since 2023-08-01. Unauthenticated subscriptions to `level2` are
+# silently ignored — no snapshot is ever sent, so the maintainer would sit
+# in INIT forever. We use `level2_batch` instead, which is public (no auth)
+# and delivers the same `snapshot` / `l2update` message shapes, batched
+# every 50ms. No change to CoinbaseL2Maintainer is needed.
 def run_coinbase(store: DataStore):
     url = "wss://ws-feed.exchange.coinbase.com"
     product_ids = [SYMBOL_MAP["coinbase"][s] for s in SYMBOLS]
     subscribe = {
         "type": "subscribe",
         "product_ids": product_ids,
-        "channels": ["matches", "ticker", "level2"],
+        "channels": ["matches", "ticker", "level2_batch"],
     }
 
     def on_message(_ws, raw):
@@ -555,12 +563,20 @@ def run_coinbase(store: DataStore):
             elif mtype == "l2update":
                 m = store.get_l2("coinbase", sym)
                 if m: m.on_l2update(data)
+            elif mtype == "error":
+                # Surface subscription rejections (bad channel, auth required,
+                # unknown product) instead of failing silently.
+                store.log("ERROR", "coinbase", "*",
+                          f"Subscription error: {data.get('message', '')} "
+                          f"{data.get('reason', '')}".strip())
         except Exception:
             store.record_parse_error("coinbase")
 
     def on_open(ws):
         store.set_connected("coinbase", True)
-        store.log("INFO", "coinbase", "*", "WebSocket connected, subscribing.")
+        store.log("INFO", "coinbase", "*",
+                  "WebSocket connected — subscribing to matches, ticker, "
+                  "level2_batch.")
         ws.send(json.dumps(subscribe))
     def on_close(_ws, *_a):
         store.set_connected("coinbase", False)
