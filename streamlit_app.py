@@ -62,6 +62,13 @@ MAX_TRADES_BUFFER = 1000
 MAX_EVENT_LOG     = 200
 REFRESH_INTERVAL_MS = 1000
 
+# --- feature config -------------------------------------------------------- #
+SLO_LATENCY_MS    = 250      # ingest-latency SLO; breaches counted per venue
+STALE_SECONDS     = 12       # connected but silent this long => STALE
+WATCHDOG_INTERVAL = 4        # seconds between watchdog sweeps
+LARGE_TRADE_USD   = 50_000   # notional threshold for the large-trade alerter
+VWAP_WINDOW       = 300      # trades retained per symbol for rolling VWAP
+
 # --------------------------------------------------------------------------- #
 # Normalized schema
 # --------------------------------------------------------------------------- #
@@ -348,6 +355,27 @@ class KrakenL2Maintainer:
             self.force_close = False
             return f
 
+    def inject_corruption(self) -> bool:
+        """FAULT INJECTION: silently delete the best-bid level from our local
+        book. The book is now desynced from Kraken's, but no error is raised —
+        exactly like a real dropped message. The next update Kraken sends
+        carries a CRC32 over its (correct) top-10; our corrupted book will
+        produce a different CRC, the mismatch is detected, and the normal
+        resync path fires. This demonstrates genuine checksum-driven gap
+        detection rather than a simulated one."""
+        with self.lock:
+            if self.state != "LIVE" or not self.book.bids:
+                self.store.log("WARN", self.venue, self.symbol,
+                               "Corruption requested but book is not LIVE.")
+                return False
+            victim = max(self.book.bids.keys(), key=float)
+            del self.book.bids[victim]
+            self.store.log(
+                "WARN", self.venue, self.symbol,
+                f"FAULT INJECTED — best-bid level {victim} silently deleted "
+                f"from local book. Next CRC32 from Kraken should mismatch.")
+            return True
+
     def _publish_top(self) -> None:
         b = self.book.bbo()
         if b is None:
@@ -381,6 +409,115 @@ class KrakenL2Maintainer:
 
 
 # --------------------------------------------------------------------------- #
+# Downstream consumers — fan-out demonstration
+# Each consumer independently subscribes to the normalized trade stream. The
+# DataStore dispatches every trade to all consumers, mirroring a pub/sub
+# fan-out (NATS/Kafka) without the network layer. Each consumer's
+# "messages_received" counter proves it saw the full stream independently.
+# --------------------------------------------------------------------------- #
+class Consumer:
+    name = "base"
+    kind = "base"
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.messages_received = 0
+
+    def on_trade(self, trade: Trade) -> None:
+        with self.lock:
+            self.messages_received += 1
+        self._process(trade)
+
+    def _process(self, trade: Trade) -> None:  # override
+        pass
+
+    def snapshot(self) -> dict:  # override
+        return {"messages": self.messages_received}
+
+
+class VWAPConsumer(Consumer):
+    """Rolling volume-weighted average price per symbol."""
+    name = "VWAP engine"
+    kind = "vwap"
+
+    def __init__(self, window: int = VWAP_WINDOW):
+        super().__init__()
+        self.window = window
+        self.by_symbol: dict[str, deque] = {}
+
+    def _process(self, trade: Trade) -> None:
+        with self.lock:
+            dq = self.by_symbol.setdefault(trade.symbol,
+                                           deque(maxlen=self.window))
+            dq.append((trade.price, trade.qty))
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            rows = []
+            for sym, dq in sorted(self.by_symbol.items()):
+                tot_q = sum(q for _, q in dq)
+                if tot_q > 0:
+                    rows.append({
+                        "symbol": sym,
+                        "vwap": sum(p * q for p, q in dq) / tot_q,
+                        "trades": len(dq),
+                    })
+            return {"messages": self.messages_received, "rows": rows}
+
+
+class VolumeConsumer(Consumer):
+    """Running trade count and traded volume per venue+symbol."""
+    name = "Volume tracker"
+    kind = "volume"
+
+    def __init__(self):
+        super().__init__()
+        self.stats: dict[tuple, dict] = {}
+
+    def _process(self, trade: Trade) -> None:
+        with self.lock:
+            s = self.stats.setdefault((trade.venue, trade.symbol),
+                                      {"count": 0, "volume": 0.0})
+            s["count"] += 1
+            s["volume"] += trade.qty
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            rows = [{"venue": v, "symbol": s,
+                     "trades": d["count"], "volume": d["volume"]}
+                    for (v, s), d in sorted(self.stats.items())]
+            return {"messages": self.messages_received, "rows": rows}
+
+
+class AlertConsumer(Consumer):
+    """Fires an alert when a single trade's notional exceeds a threshold."""
+    name = "Large-trade alerter"
+    kind = "alert"
+
+    def __init__(self, threshold_usd: float = LARGE_TRADE_USD,
+                 max_alerts: int = 30):
+        super().__init__()
+        self.threshold = threshold_usd
+        self.alerts: deque = deque(maxlen=max_alerts)
+
+    def _process(self, trade: Trade) -> None:
+        notional = trade.price * trade.qty
+        if notional >= self.threshold:
+            with self.lock:
+                self.alerts.append({
+                    "ts": trade.ingest_ts, "venue": trade.venue,
+                    "symbol": trade.symbol, "side": trade.side,
+                    "price": trade.price, "qty": trade.qty,
+                    "notional": notional,
+                })
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {"messages": self.messages_received,
+                    "alerts": list(self.alerts)[::-1]}
+
+
+# --------------------------------------------------------------------------- #
 # Shared DataStore
 # --------------------------------------------------------------------------- #
 class DataStore:
@@ -391,7 +528,8 @@ class DataStore:
         self.health = {
             v: {"connected": False, "messages": 0,
                 "transport_errors": 0, "parse_errors": 0,
-                "last_msg_ts": 0.0}
+                "last_msg_ts": 0.0, "slo_breaches": 0,
+                "derived_state": "DOWN"}
             for v in VENUES
         }
         self.events: deque = deque(maxlen=MAX_EVENT_LOG)
@@ -403,6 +541,12 @@ class DataStore:
                 self.l2[(venue, sym)] = CoinbaseL2Maintainer(self, sym, native)
             elif venue == "kraken":
                 self.l2[(venue, sym)] = KrakenL2Maintainer(self, sym, native)
+        # downstream consumers (fan-out)
+        self.consumers: list[Consumer] = [
+            VWAPConsumer(), VolumeConsumer(), AlertConsumer()]
+        # WebSocket handles, for fault injection
+        self._ws_handles: dict = {}
+        self._ws_lock = threading.Lock()
         self.stop_event = threading.Event()
         self._started = False
 
@@ -410,7 +554,19 @@ class DataStore:
     def add_trade(self, t: Trade):
         with self.lock:
             self.trades.append(t)
-            h = self.health[t.venue]; h["messages"] += 1; h["last_msg_ts"] = t.ingest_ts
+            h = self.health[t.venue]
+            h["messages"] += 1
+            h["last_msg_ts"] = t.ingest_ts
+            lat = t.ingest_ts - t.exchange_ts
+            # count an SLO breach only for sane latencies (clock skew excluded)
+            if 0 <= lat <= 60_000 and lat > SLO_LATENCY_MS:
+                h["slo_breaches"] += 1
+        # fan out to downstream consumers OUTSIDE the store lock
+        for c in self.consumers:
+            try:
+                c.on_trade(t)
+            except Exception:
+                pass
 
     def set_bbo(self, b: BBO):
         with self.lock:
@@ -423,6 +579,30 @@ class DataStore:
         with self.lock: self.health[v]["parse_errors"] += 1
     def set_connected(self, v, c):
         with self.lock: self.health[v]["connected"] = c
+
+    # WebSocket handle registry — used by fault injection
+    def register_ws(self, venue, ws):
+        with self._ws_lock:
+            self._ws_handles[venue] = ws
+
+    def drop_connection(self, venue) -> bool:
+        """Force-close a venue's WebSocket. The reconnect loop will bring it
+        back. Used to demonstrate fault tolerance / recovery on demand."""
+        with self._ws_lock:
+            ws = self._ws_handles.get(venue)
+        if ws is None:
+            self.log("WARN", venue, "*",
+                     "FAULT INJECTION requested but no live socket handle.")
+            return False
+        self.log("WARN", venue, "*",
+                 "FAULT INJECTED — forcing WebSocket close. Reconnect loop "
+                 "will recover automatically.")
+        try:
+            ws.close()
+            return True
+        except Exception as e:
+            self.log("ERROR", venue, "*", f"Forced close failed: {e}")
+            return False
 
     def log(self, level, venue, symbol, msg):
         with self.event_lock:
@@ -455,9 +635,9 @@ class DataStore:
         if self._started:
             return
         self._started = True
-        for fn in (run_binance, run_coinbase, run_kraken):
+        for fn in (run_binance, run_coinbase, run_kraken, run_watchdog):
             threading.Thread(target=fn, args=(self,), daemon=True,
-                             name=f"ws-{fn.__name__}").start()
+                             name=f"thread-{fn.__name__}").start()
 
 
 # --------------------------------------------------------------------------- #
@@ -724,6 +904,7 @@ def _run_forever_with_backoff(url, on_message, on_open, on_close, on_error, stor
         try:
             ws = websocket.WebSocketApp(url, on_message=on_message, on_open=on_open,
                                         on_close=on_close, on_error=on_error)
+            store.register_ws(venue, ws)  # expose handle for fault injection
             ws.run_forever(ping_interval=20, ping_timeout=10)
             backoff = 1.0
         except Exception:
@@ -732,6 +913,35 @@ def _run_forever_with_backoff(url, on_message, on_open, on_close, on_error, stor
         if store.stop_event.is_set(): return
         time.sleep(backoff)
         backoff = min(backoff * 2, 30.0)
+
+
+# --------------------------------------------------------------------------- #
+# Watchdog — derives LIVE / STALE / DOWN per venue and logs transitions.
+# A feed can be "connected" yet silent; this catches that dead-but-open case.
+# --------------------------------------------------------------------------- #
+def run_watchdog(store: DataStore):
+    prev: dict = {v: None for v in VENUES}
+    while not store.stop_event.is_set():
+        time.sleep(WATCHDOG_INTERVAL)
+        now = _now_ms()
+        for v in VENUES:
+            with store.lock:
+                connected = store.health[v]["connected"]
+                last = store.health[v]["last_msg_ts"]
+            if not connected:
+                state = "DOWN"
+            elif last and (now - last) / 1000.0 > STALE_SECONDS:
+                state = "STALE"
+            elif not last:
+                state = "DOWN"
+            else:
+                state = "LIVE"
+            with store.lock:
+                store.health[v]["derived_state"] = state
+            if prev[v] is not None and prev[v] != state:
+                lvl = "WARN" if state in ("STALE", "DOWN") else "INFO"
+                store.log(lvl, v, "*", f"Feed state: {prev[v]} → {state}")
+            prev[v] = state
 
 
 # --------------------------------------------------------------------------- #
@@ -774,17 +984,41 @@ with st.sidebar:
     st.header("Feed health")
     health = store.snapshot_health()
     now = _now_ms()
+    _state_dot = {"LIVE": "🟢", "STALE": "🟡", "DOWN": "🔴"}
     for venue, h in health.items():
-        dot = "🟢" if h["connected"] else "🔴"
+        dot = _state_dot.get(h.get("derived_state", "DOWN"), "⚪")
         age_txt = (f"{(now - h['last_msg_ts']) / 1000.0:.1f}s ago"
                    if h["last_msg_ts"] else "no data yet")
         st.markdown(
-            f"{dot} **{venue}** &nbsp; `{h['messages']:,}` msgs<br>"
+            f"{dot} **{venue}** — {h.get('derived_state', 'DOWN')} &nbsp; "
+            f"`{h['messages']:,}` msgs<br>"
             f"&nbsp;&nbsp;last: {age_txt}<br>"
             f"&nbsp;&nbsp;transport err: {h['transport_errors']} &nbsp;|&nbsp; "
-            f"parse err: {h['parse_errors']}",
+            f"parse err: {h['parse_errors']} &nbsp;|&nbsp; "
+            f"SLO breaches: {h['slo_breaches']}",
             unsafe_allow_html=True,
         )
+
+    st.header("🔧 Fault injection")
+    st.caption("Trigger failures on demand to demonstrate recovery.")
+    fb1, fb2 = st.columns(2)
+    with fb1:
+        if st.button("Drop Coinbase", use_container_width=True):
+            store.drop_connection("coinbase")
+        if st.button("Drop Binance", use_container_width=True):
+            store.drop_connection("binance")
+    with fb2:
+        if st.button("Drop Kraken", use_container_width=True):
+            store.drop_connection("kraken")
+        if st.button("Corrupt Kraken book", use_container_width=True):
+            hit = False
+            for _sym in SYMBOLS:
+                _m = store.get_l2("kraken", _sym)
+                if isinstance(_m, KrakenL2Maintainer) and _m.inject_corruption():
+                    hit = True
+            if not hit:
+                st.toast("Kraken book not LIVE yet — nothing to corrupt.")
+
     st.divider()
     st.caption(
         "Binance L2 is disabled in this build — Streamlit Cloud's egress IP "
@@ -947,6 +1181,112 @@ else:
                      use_container_width=True, hide_index=True, height=420)
     except Exception:
         st.dataframe(ev_df, use_container_width=True, hide_index=True, height=420)
+
+st.divider()
+
+# ===== Section: Latency SLO monitor ======================================= #
+st.header("⏱️ Latency SLO monitor")
+st.caption(
+    f"SLO threshold: **{SLO_LATENCY_MS} ms** ingest latency. Percentiles are "
+    f"over the in-memory trade buffer (~{MAX_TRADES_BUFFER} trades); the SLO "
+    f"breach counter is a running total since startup. Latency here reflects "
+    f"the Streamlit Cloud VM's path to each venue, not a production system."
+)
+trades_all = store.snapshot_trades()
+health = store.snapshot_health()
+if trades_all.empty:
+    st.info("Waiting for trades…")
+else:
+    t = trades_all.copy()
+    t["latency_ms"] = t["ingest_ts"] - t["exchange_ts"]
+    t = t[(t["latency_ms"] >= 0) & (t["latency_ms"] < 60_000)]  # drop clock skew
+    rows = []
+    for venue in VENUES:
+        lat = t[t["venue"] == venue]["latency_ms"]
+        if len(lat) == 0:
+            continue
+        breaches = health[venue]["slo_breaches"]
+        total = health[venue]["messages"]
+        rows.append({
+            "venue": venue,
+            "p50 ms": lat.quantile(0.50),
+            "p99 ms": lat.quantile(0.99),
+            "p99.9 ms": lat.quantile(0.999),
+            "max ms": lat.max(),
+            "SLO breaches": breaches,
+            "breach rate": (f"{breaches / total * 100:.2f}%"
+                            if total else "—"),
+        })
+    if rows:
+        slo_df = pd.DataFrame(rows)
+        st.dataframe(
+            slo_df.round({"p50 ms": 1, "p99 ms": 1, "p99.9 ms": 1, "max ms": 1}),
+            use_container_width=True, hide_index=True,
+        )
+        worst = max(rows, key=lambda r: r["p99 ms"])
+        if worst["p99 ms"] > SLO_LATENCY_MS:
+            st.warning(
+                f"⚠️ {worst['venue']} p99 latency ({worst['p99 ms']:.0f} ms) "
+                f"exceeds the {SLO_LATENCY_MS} ms SLO — in production this "
+                f"would page the on-call engineer."
+            )
+        else:
+            st.success(
+                f"All venues within the {SLO_LATENCY_MS} ms p99 SLO.")
+    else:
+        st.info("Not enough clean latency samples yet…")
+
+st.divider()
+
+# ===== Section: Consumer fan-out ========================================== #
+st.header("🔀 Consumer fan-out")
+st.caption(
+    "Three independent downstream consumers, each subscribing to the same "
+    "normalized trade stream. The DataStore dispatches every trade to all of "
+    "them — this is the pub/sub fan-out pattern (one source, many consumers) "
+    "without the network layer. Each consumer's message count proves it "
+    "received the full stream independently."
+)
+cons_cols = st.columns(3)
+for col, consumer in zip(cons_cols, store.consumers):
+    csnap = consumer.snapshot()
+    with col:
+        st.markdown(f"**{consumer.name}**")
+        st.metric("Messages received", f"{csnap['messages']:,}")
+
+        if consumer.kind == "vwap":
+            if csnap["rows"]:
+                st.dataframe(
+                    pd.DataFrame(csnap["rows"]).round({"vwap": 2}),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.caption("Awaiting trades…")
+            st.caption("Rolling volume-weighted average price per symbol.")
+
+        elif consumer.kind == "volume":
+            if csnap["rows"]:
+                st.dataframe(
+                    pd.DataFrame(csnap["rows"]).round({"volume": 6}),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.caption("Awaiting trades…")
+            st.caption("Running trade count and volume per venue+symbol.")
+
+        elif consumer.kind == "alert":
+            alerts = csnap["alerts"]
+            st.metric("Alerts fired", len(alerts))
+            if alerts:
+                adf = pd.DataFrame(alerts)
+                adf["time"] = (pd.to_datetime(adf["ts"], unit="ms")
+                                 .dt.strftime("%H:%M:%S"))
+                adf["notional"] = adf["notional"].round(0)
+                st.dataframe(
+                    adf[["time", "venue", "symbol", "side", "notional"]],
+                    use_container_width=True, hide_index=True, height=220)
+            else:
+                st.caption(f"No trades ≥ ${LARGE_TRADE_USD:,.0f} notional yet.")
+            st.caption(f"Fires when a single trade exceeds "
+                       f"${LARGE_TRADE_USD:,.0f} notional.")
 
 st.divider()
 
