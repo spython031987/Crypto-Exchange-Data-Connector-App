@@ -46,7 +46,46 @@ SYMBOLS = ["BTC-USD", "ETH-USD"]
 
 # --- branding -------------------------------------------------------------- #
 APP_NAME = "Conflux"
-APP_TAGLINE = "Many venue feeds, one normalized stream."
+APP_TAGLINE = "Every venue. One stream."
+APP_SUBTITLE = (
+    "Live normalized feeds from Binance (trades/BBO), Coinbase, and Kraken, "
+    "with real L2 order book maintainers on Coinbase and Kraken."
+)
+
+
+def logo_svg(width: int = 380, show_wordmark: bool = True) -> str:
+    """Inline SVG: three venue strands converging into one normalized stream.
+    Themeable, scales cleanly, no external image hosting required."""
+    wordmark = (
+        '<text x="232" y="70" font-family="Inter, Segoe UI, sans-serif" '
+        'font-size="34" font-weight="700" fill="currentColor" '
+        'letter-spacing="-0.5">Conflux</text>'
+    ) if show_wordmark else ""
+    vb_w = 470 if show_wordmark else 224
+    return f'''
+<svg width="{width}" viewBox="0 0 {vb_w} 120" xmlns="http://www.w3.org/2000/svg"
+     role="img" aria-label="Conflux logo">
+  <defs>
+    <linearGradient id="cfx_merged" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f7931a"/>
+      <stop offset="100%" stop-color="#ffd27f"/>
+    </linearGradient>
+  </defs>
+  <!-- three venue strands flowing in from the left -->
+  <path d="M 10 28 C 70 28, 78 60, 128 60" fill="none"
+        stroke="#26a69a" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 10 60 C 78 60, 80 60, 128 60" fill="none"
+        stroke="#5c9ded" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 10 92 C 70 92, 78 60, 128 60" fill="none"
+        stroke="#ef5350" stroke-width="6" stroke-linecap="round"/>
+  <!-- convergence node -->
+  <circle cx="130" cy="60" r="10" fill="#f7931a"/>
+  <!-- single merged stream out -->
+  <path d="M 130 60 L 206 60" fill="none"
+        stroke="url(#cfx_merged)" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="210" cy="60" r="6" fill="#ffd27f"/>
+  {wordmark}
+</svg>'''.strip()
 
 SYMBOL_MAP = {
     "binance":  {"BTC-USD": "btcusdt", "ETH-USD": "ethusdt"},
@@ -1080,8 +1119,12 @@ def login_required(store: DataStore) -> None:
         return  # authenticated — fall through to dashboard
 
     # ---- render login form ------------------------------------------------
-    st.title(f"🪙 {APP_NAME}")
-    st.caption(f"{APP_TAGLINE} &nbsp;·&nbsp; Sign in to continue.")
+    st.markdown(
+        f'<div style="color:#fafafa; margin-bottom:0.25rem;">'
+        f'{logo_svg(width=300)}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"**{APP_TAGLINE}** &nbsp;·&nbsp; Sign in to continue.")
 
     users = _get_users_from_secrets()
     if not users:
@@ -1135,12 +1178,12 @@ store = get_store()
 login_required(store)
 session = current_session()  # guaranteed non-None past this point
 
-st.title(f"🪙 {APP_NAME}")
-st.caption(
-    f"{APP_TAGLINE} &nbsp;·&nbsp; Live normalized feeds from Binance "
-    "(trades/BBO), Coinbase, and Kraken, with real L2 order book maintainers "
-    "on Coinbase and Kraken."
+st.markdown(
+    f'<div style="color:#fafafa; margin-bottom:0.25rem;">'
+    f'{logo_svg(width=320)}</div>',
+    unsafe_allow_html=True,
 )
+st.caption(f"**{APP_TAGLINE}** &nbsp;·&nbsp; {APP_SUBTITLE}")
 
 st_autorefresh(interval=REFRESH_INTERVAL_MS, key="autorefresh")
 
