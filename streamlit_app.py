@@ -35,6 +35,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import websocket
+import bcrypt
 from streamlit_autorefresh import st_autorefresh
 
 # --------------------------------------------------------------------------- #
@@ -534,6 +535,9 @@ class DataStore:
         }
         self.events: deque = deque(maxlen=MAX_EVENT_LOG)
         self.event_lock = threading.Lock()
+        # Audit log — security-sensitive events (logins, role-gated actions)
+        self.audit_events: deque = deque(maxlen=500)
+        self.audit_lock = threading.Lock()
         self.l2: dict = {}
         for venue, sym in L2_TARGETS:
             native = SYMBOL_MAP[venue][sym]
@@ -610,6 +614,19 @@ class DataStore:
                 "ts": time.time() * 1000.0,
                 "level": level, "venue": venue, "symbol": symbol, "msg": msg,
             })
+
+    def audit(self, level, username, role, action, msg):
+        """Record a security-relevant event (login, role-gated action, etc.)."""
+        with self.audit_lock:
+            self.audit_events.append({
+                "ts": time.time() * 1000.0,
+                "level": level, "user": username, "role": role,
+                "action": action, "msg": msg,
+            })
+
+    def snapshot_audit(self, n: int = 100):
+        with self.audit_lock:
+            return list(self.audit_events)[-n:][::-1]
 
     # readers
     def snapshot_trades(self) -> pd.DataFrame:
@@ -955,11 +972,171 @@ def get_store() -> DataStore:
 
 
 # --------------------------------------------------------------------------- #
+# Authentication & RBAC
+# --------------------------------------------------------------------------- #
+# Three-role hierarchy. Higher number includes all permissions of lower roles.
+ROLE_HIERARCHY = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+@dataclass
+class Session:
+    username: str
+    role: str
+    login_ts: float
+
+
+def _get_users_from_secrets() -> dict:
+    """Read the user table from Streamlit Cloud secrets.
+
+    Expected structure (in Streamlit Cloud → Settings → Secrets):
+
+        [auth]
+        session_timeout_minutes = 60
+
+        [auth.users.alice]
+        password_hash = "$2b$12$..."
+        role = "admin"
+    """
+    try:
+        auth = st.secrets["auth"]
+        users = auth["users"]
+        # st.secrets returns an AttrDict — convert to plain dict so we can
+        # iterate cleanly.
+        return {name: dict(rec) for name, rec in dict(users).items()}
+    except Exception:
+        return {}
+
+
+def _get_session_timeout_minutes() -> int:
+    try:
+        return int(st.secrets["auth"].get("session_timeout_minutes", 60))
+    except Exception:
+        return 60
+
+
+def authenticate(username: str, password: str) -> tuple[bool, str]:
+    """Returns (ok, role_or_error). Generic error message — does not reveal
+    whether the username exists, which is the standard security practice."""
+    GENERIC = "Invalid username or password."
+    users = _get_users_from_secrets()
+    if not username or username not in users:
+        # Still do a bcrypt check against a dummy hash to keep timing constant
+        try:
+            bcrypt.checkpw(b"x", b"$2b$12$" + b"a" * 53)
+        except Exception:
+            pass
+        return False, GENERIC
+    record = users[username]
+    stored = (record.get("password_hash") or "").encode("utf-8")
+    if not stored or not stored.startswith(b"$2"):
+        return False, GENERIC
+    try:
+        ok = bcrypt.checkpw(password.encode("utf-8"), stored)
+    except Exception:
+        return False, GENERIC
+    if not ok:
+        return False, GENERIC
+    role = record.get("role", "viewer")
+    if role not in ROLE_HIERARCHY:
+        return False, f"Account misconfigured (invalid role)."
+    return True, role
+
+
+def current_session() -> Session | None:
+    return st.session_state.get("session")
+
+
+def require_role(role: str) -> bool:
+    sess = current_session()
+    if sess is None:
+        return False
+    return ROLE_HIERARCHY.get(sess.role, -1) >= ROLE_HIERARCHY[role]
+
+
+def login_required(store: DataStore) -> None:
+    """If no valid session, render the login form and st.stop(). Otherwise
+    return after refreshing the last-activity timestamp."""
+    sess = current_session()
+    timeout_s = _get_session_timeout_minutes() * 60
+    now = time.time()
+
+    # session timeout check
+    if sess is not None:
+        last_activity = st.session_state.get("last_activity", sess.login_ts)
+        if now - last_activity > timeout_s:
+            store.audit("INFO", sess.username, sess.role, "session_timeout",
+                        "Session expired due to inactivity.")
+            del st.session_state["session"]
+            st.session_state.pop("last_activity", None)
+            sess = None
+            st.info("Your session expired. Please log in again.")
+
+    if sess is not None:
+        st.session_state["last_activity"] = now
+        return  # authenticated — fall through to dashboard
+
+    # ---- render login form ------------------------------------------------
+    st.title("🪙 Crypto Market Data Gateway")
+    st.caption("Operator console — authentication required.")
+
+    users = _get_users_from_secrets()
+    if not users:
+        st.error(
+            "No users are configured. The administrator must add an "
+            "`[auth]` block to the app's secrets in Streamlit Cloud "
+            "(Settings → Secrets)."
+        )
+        st.markdown(
+            "See `.streamlit/secrets.toml.example` in the repository for the "
+            "exact format, and use `generate_password_hash.py` to produce "
+            "bcrypt hashes."
+        )
+        st.stop()
+
+    col_a, col_b, col_c = st.columns([1, 2, 1])
+    with col_b:
+        with st.form("login_form", clear_on_submit=False):
+            u = st.text_input("Username", autocomplete="username")
+            p = st.text_input("Password", type="password",
+                              autocomplete="current-password")
+            submitted = st.form_submit_button("Log in", type="primary",
+                                              use_container_width=True)
+        if submitted:
+            ok, info = authenticate(u, p)
+            if ok:
+                st.session_state["session"] = Session(
+                    username=u, role=info, login_ts=now)
+                st.session_state["last_activity"] = now
+                store.audit("INFO", u, info, "login", "Successful login.")
+                st.rerun()
+            else:
+                store.audit("WARN", u or "<empty>", "?", "login_failed", info)
+                st.error(info)
+
+        st.caption(
+            "Roles: **viewer** (read-only) · **operator** (read + fault "
+            "injection) · **admin** (full access including audit log)."
+        )
+
+    st.stop()
+
+
+# --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Crypto Market Data Gateway — v3",
+st.set_page_config(page_title="Crypto Market Data Gateway — v5",
                    page_icon="🪙", layout="wide")
-st.title("🪙 Unified Crypto Market Data Gateway — v3")
+
+# get_store() runs the WebSocket threads regardless of who's logged in, so the
+# feed is warm when an authorized user arrives.
+store = get_store()
+
+# Gate everything below behind authentication. Renders login form + st.stop()
+# if no valid session.
+login_required(store)
+session = current_session()  # guaranteed non-None past this point
+
+st.title("🪙 Unified Crypto Market Data Gateway — v5")
 st.caption(
     "Live normalized feeds from Binance (trades/BBO only), Coinbase, and "
     "Kraken — with real L2 order book maintainers on Coinbase (in-band "
@@ -967,11 +1144,26 @@ st.caption(
     "checksum). Two different sync protocols, one normalized output."
 )
 
-store = get_store()
 st_autorefresh(interval=REFRESH_INTERVAL_MS, key="autorefresh")
 
 # Sidebar: controls & feed health
 with st.sidebar:
+    # --- Signed-in user header --------------------------------------------
+    _role_badge = {"viewer": "👁", "operator": "🔧", "admin": "⚙️"}.get(
+        session.role, "👤")
+    st.markdown(
+        f"{_role_badge} **{session.username}** &nbsp;"
+        f"<span style='opacity:0.7'>({session.role})</span>",
+        unsafe_allow_html=True,
+    )
+    if st.button("Log out", use_container_width=True):
+        store.audit("INFO", session.username, session.role,
+                    "logout", "User logged out.")
+        st.session_state.pop("session", None)
+        st.session_state.pop("last_activity", None)
+        st.rerun()
+    st.divider()
+
     st.header("Controls")
     selected_symbol = st.selectbox("Symbol (cross-venue panels)", SYMBOLS, index=0)
     l2_choice = st.selectbox(
@@ -987,37 +1179,63 @@ with st.sidebar:
     _state_dot = {"LIVE": "🟢", "STALE": "🟡", "DOWN": "🔴"}
     for venue, h in health.items():
         dot = _state_dot.get(h.get("derived_state", "DOWN"), "⚪")
-        age_txt = (f"{(now - h['last_msg_ts']) / 1000.0:.1f}s ago"
-                   if h["last_msg_ts"] else "no data yet")
+        last_ts = h.get("last_msg_ts", 0.0)
+        age_txt = (f"{(now - last_ts) / 1000.0:.1f}s ago"
+                   if last_ts else "no data yet")
         st.markdown(
             f"{dot} **{venue}** — {h.get('derived_state', 'DOWN')} &nbsp; "
-            f"`{h['messages']:,}` msgs<br>"
+            f"`{h.get('messages', 0):,}` msgs<br>"
             f"&nbsp;&nbsp;last: {age_txt}<br>"
-            f"&nbsp;&nbsp;transport err: {h['transport_errors']} &nbsp;|&nbsp; "
-            f"parse err: {h['parse_errors']} &nbsp;|&nbsp; "
-            f"SLO breaches: {h['slo_breaches']}",
+            f"&nbsp;&nbsp;transport err: {h.get('transport_errors', 0)} "
+            f"&nbsp;|&nbsp; parse err: {h.get('parse_errors', 0)} "
+            f"&nbsp;|&nbsp; SLO breaches: {h.get('slo_breaches', 0)}",
             unsafe_allow_html=True,
         )
 
+    # --- Fault injection (operator or admin only) -------------------------
     st.header("🔧 Fault injection")
-    st.caption("Trigger failures on demand to demonstrate recovery.")
-    fb1, fb2 = st.columns(2)
-    with fb1:
-        if st.button("Drop Coinbase", use_container_width=True):
-            store.drop_connection("coinbase")
-        if st.button("Drop Binance", use_container_width=True):
-            store.drop_connection("binance")
-    with fb2:
-        if st.button("Drop Kraken", use_container_width=True):
-            store.drop_connection("kraken")
-        if st.button("Corrupt Kraken book", use_container_width=True):
-            hit = False
-            for _sym in SYMBOLS:
-                _m = store.get_l2("kraken", _sym)
-                if isinstance(_m, KrakenL2Maintainer) and _m.inject_corruption():
-                    hit = True
-            if not hit:
-                st.toast("Kraken book not LIVE yet — nothing to corrupt.")
+    if not require_role("operator"):
+        st.caption("_Requires `operator` or `admin` role._")
+    else:
+        st.caption("Trigger failures on demand to demonstrate recovery.")
+        fb1, fb2 = st.columns(2)
+
+        def _do_drop(venue: str) -> None:
+            # Double-check role at action time (defense in depth)
+            if not require_role("operator"):
+                store.audit("WARN", session.username, session.role,
+                            "denied", f"drop {venue}: insufficient role")
+                return
+            store.drop_connection(venue)
+            store.audit("INFO", session.username, session.role,
+                        "fault_inject_drop",
+                        f"Force-dropped {venue} WebSocket.")
+
+        with fb1:
+            if st.button("Drop Coinbase", use_container_width=True):
+                _do_drop("coinbase")
+            if st.button("Drop Binance", use_container_width=True):
+                _do_drop("binance")
+        with fb2:
+            if st.button("Drop Kraken", use_container_width=True):
+                _do_drop("kraken")
+            if st.button("Corrupt Kraken book", use_container_width=True):
+                if not require_role("operator"):
+                    store.audit("WARN", session.username, session.role,
+                                "denied",
+                                "corrupt kraken book: insufficient role")
+                else:
+                    hit = False
+                    for _sym in SYMBOLS:
+                        _m = store.get_l2("kraken", _sym)
+                        if (isinstance(_m, KrakenL2Maintainer)
+                                and _m.inject_corruption()):
+                            hit = True
+                    store.audit("INFO", session.username, session.role,
+                                "fault_inject_corrupt",
+                                f"Corrupted Kraken book (success={hit}).")
+                    if not hit:
+                        st.toast("Kraken book not LIVE yet — nothing to corrupt.")
 
     st.divider()
     st.caption(
@@ -1205,8 +1423,8 @@ else:
         lat = t[t["venue"] == venue]["latency_ms"]
         if len(lat) == 0:
             continue
-        breaches = health[venue]["slo_breaches"]
-        total = health[venue]["messages"]
+        breaches = health[venue].get("slo_breaches", 0)
+        total = health[venue].get("messages", 0)
         rows.append({
             "venue": venue,
             "p50 ms": lat.quantile(0.50),
@@ -1289,6 +1507,44 @@ for col, consumer in zip(cons_cols, store.consumers):
                        f"${LARGE_TRADE_USD:,.0f} notional.")
 
 st.divider()
+
+# ===== Section: Audit log (admin only) ==================================== #
+if require_role("admin"):
+    st.header("🛡 Audit log")
+    st.caption(
+        "Security-sensitive events: logins, failed logins, role-gated "
+        "actions, fault injection. Admin-only view. In production this would "
+        "be an append-only sink (S3, SIEM) rather than in-memory."
+    )
+    audit_events = store.snapshot_audit(80)
+    if not audit_events:
+        st.info("No audit events yet.")
+    else:
+        adf = pd.DataFrame(audit_events)
+        adf["time"] = (pd.to_datetime(adf["ts"], unit="ms")
+                         .dt.strftime("%H:%M:%S.%f").str[:-3])
+        adf = adf[["time", "level", "user", "role", "action", "msg"]]
+        def _audit_style(row):
+            color = {"INFO": "", "WARN": "color: #f9a825;",
+                     "ERROR": "color: #ef5350;"}.get(row["level"], "")
+            return [color] * len(row)
+        try:
+            st.dataframe(adf.style.apply(_audit_style, axis=1),
+                         use_container_width=True, hide_index=True, height=320)
+        except Exception:
+            st.dataframe(adf, use_container_width=True, hide_index=True, height=320)
+
+    # User roster
+    st.markdown("**Configured users**")
+    users_cfg = _get_users_from_secrets()
+    if users_cfg:
+        urows = [{"username": u, "role": r.get("role", "?")}
+                 for u, r in sorted(users_cfg.items())]
+        st.dataframe(pd.DataFrame(urows),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No users configured in secrets.")
+    st.divider()
 
 # ===== Section 4: price chart + latency =================================== #
 st.subheader(f"Recent trade prices across venues — {selected_symbol}")
