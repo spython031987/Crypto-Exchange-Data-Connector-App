@@ -1,6 +1,6 @@
 """
-Unified Crypto Market Data Gateway — v3
-=======================================
+Conflux — Unified Crypto Market Data Gateway
+============================================
 v3 dispenses with Binance L2 (Streamlit Cloud egress is blocked from
 Binance's REST snapshot endpoint) and instead demonstrates two different
 real-world L2 synchronization protocols on the venues that DO work:
@@ -43,6 +43,10 @@ from streamlit_autorefresh import st_autorefresh
 # --------------------------------------------------------------------------- #
 VENUES = ["binance", "coinbase", "kraken"]
 SYMBOLS = ["BTC-USD", "ETH-USD"]
+
+# --- branding -------------------------------------------------------------- #
+APP_NAME = "Conflux"
+APP_TAGLINE = "Many venue feeds, one normalized stream."
 
 SYMBOL_MAP = {
     "binance":  {"BTC-USD": "btcusdt", "ETH-USD": "ethusdt"},
@@ -1076,8 +1080,8 @@ def login_required(store: DataStore) -> None:
         return  # authenticated — fall through to dashboard
 
     # ---- render login form ------------------------------------------------
-    st.title("🪙 Crypto Market Data Gateway")
-    st.caption("Operator console — authentication required.")
+    st.title(f"🪙 {APP_NAME}")
+    st.caption(f"{APP_TAGLINE} &nbsp;·&nbsp; Sign in to continue.")
 
     users = _get_users_from_secrets()
     if not users:
@@ -1113,18 +1117,13 @@ def login_required(store: DataStore) -> None:
                 store.audit("WARN", u or "<empty>", "?", "login_failed", info)
                 st.error(info)
 
-        st.caption(
-            "Roles: **viewer** (read-only) · **operator** (read + fault "
-            "injection) · **admin** (full access including audit log)."
-        )
-
     st.stop()
 
 
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Crypto Market Data Gateway — v5",
+st.set_page_config(page_title=APP_NAME,
                    page_icon="🪙", layout="wide")
 
 # get_store() runs the WebSocket threads regardless of who's logged in, so the
@@ -1136,12 +1135,11 @@ store = get_store()
 login_required(store)
 session = current_session()  # guaranteed non-None past this point
 
-st.title("🪙 Unified Crypto Market Data Gateway — v5")
+st.title(f"🪙 {APP_NAME}")
 st.caption(
-    "Live normalized feeds from Binance (trades/BBO only), Coinbase, and "
-    "Kraken — with real L2 order book maintainers on Coinbase (in-band "
-    "snapshot + ordered stream) and Kraken (in-band snapshot + CRC32 "
-    "checksum). Two different sync protocols, one normalized output."
+    f"{APP_TAGLINE} &nbsp;·&nbsp; Live normalized feeds from Binance "
+    "(trades/BBO), Coinbase, and Kraken, with real L2 order book maintainers "
+    "on Coinbase and Kraken."
 )
 
 st_autorefresh(interval=REFRESH_INTERVAL_MS, key="autorefresh")
