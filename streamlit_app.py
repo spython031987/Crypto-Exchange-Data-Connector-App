@@ -113,6 +113,24 @@ WATCHDOG_INTERVAL = 4        # seconds between watchdog sweeps
 LARGE_TRADE_USD   = 50_000   # notional threshold for the large-trade alerter
 VWAP_WINDOW       = 300      # trades retained per symbol for rolling VWAP
 
+# --- arbitrage / fee config ------------------------------------------------ #
+# Taker fees are the % paid when crossing the spread (market order). These are
+# representative public spot taker fees at a low VIP tier and WILL differ for
+# your actual account/volume — they're editable defaults, not gospel.
+# Withdrawal fees are a flat cost (in units of the BASE asset) to move coins
+# off the venue; arbitrage requires moving the asset between venues, so the
+# withdrawal cost of the SELL-side venue applies to the leg being moved.
+VENUE_FEES = {
+    # venue:   taker_fee_pct (as fraction),  withdrawal (base-asset units) by symbol
+    "binance":  {"taker": 0.00100, "withdraw": {"BTC-USD": 0.0002, "ETH-USD": 0.0015}},
+    "coinbase": {"taker": 0.00120, "withdraw": {"BTC-USD": 0.0001, "ETH-USD": 0.0010}},
+    "kraken":   {"taker": 0.00160, "withdraw": {"BTC-USD": 0.00005, "ETH-USD": 0.0005}},
+}
+# Only flag an opportunity if net edge clears this (basis points). Real arbs
+# need a margin above zero to cover slippage, timing, and execution risk.
+ARB_MIN_NET_BPS = 5.0
+ARB_STALE_MS = 3000  # ignore a venue's quote for arb if older than this
+
 # --------------------------------------------------------------------------- #
 # Normalized schema
 # --------------------------------------------------------------------------- #
@@ -138,6 +156,87 @@ class BBO:
     ask_size: float
     exchange_ts: float
     ingest_ts: float
+
+
+# --------------------------------------------------------------------------- #
+# Arbitrage math
+# --------------------------------------------------------------------------- #
+def compute_arbitrage(symbol: str, quotes: dict, fees: dict,
+                      now_ms: float, stale_ms: float = ARB_STALE_MS) -> dict | None:
+    """Given the latest BBO per venue for one symbol, find the best
+    buy-low / sell-high pair and compute both the gross and net-of-fees edge.
+
+    quotes: {venue: {"bid","ask","bid_size","ask_size","ingest_ts"}}
+    fees:   VENUE_FEES
+
+    Returns a dict describing the best opportunity, or None if fewer than two
+    venues have fresh quotes.
+
+    Arbitrage mechanics modeled:
+      - BUY at the cheapest venue's ASK (you cross the spread, pay taker fee)
+      - SELL at the richest venue's BID (you cross the spread, pay taker fee)
+      - MOVE the asset from buy-venue to sell-venue, paying the buy-venue's
+        withdrawal fee (a flat amount in base-asset units), converted to a
+        cost in quote terms at the buy price.
+    Net edge = sell proceeds after fee − buy cost after fee − withdrawal cost,
+    expressed in basis points of the buy cost.
+    """
+    fresh = {v: q for v, q in quotes.items()
+             if q and q.get("ask", 0) > 0 and q.get("bid", 0) > 0
+             and (now_ms - q.get("ingest_ts", 0)) <= stale_ms}
+    if len(fresh) < 2:
+        return None
+
+    # Best venue to BUY: lowest ask. Best venue to SELL: highest bid.
+    buy_venue = min(fresh, key=lambda v: fresh[v]["ask"])
+    sell_venue = max(fresh, key=lambda v: fresh[v]["bid"])
+    if buy_venue == sell_venue:
+        # Same venue is both cheapest-ask and highest-bid → no cross-venue arb
+        # Pick the next-best distinct pair if available.
+        buys = sorted(fresh, key=lambda v: fresh[v]["ask"])
+        sells = sorted(fresh, key=lambda v: -fresh[v]["bid"])
+        pair = None
+        for b in buys:
+            for s in sells:
+                if b != s:
+                    pair = (b, s); break
+            if pair: break
+        if not pair:
+            return None
+        buy_venue, sell_venue = pair
+
+    buy_ask = fresh[buy_venue]["ask"]
+    sell_bid = fresh[sell_venue]["bid"]
+
+    gross_bps = (sell_bid - buy_ask) / buy_ask * 1e4
+
+    buy_taker = fees[buy_venue]["taker"]
+    sell_taker = fees[sell_venue]["taker"]
+    withdraw_base = fees[buy_venue]["withdraw"].get(symbol, 0.0)
+
+    # Per 1 unit of base asset:
+    buy_cost = buy_ask * (1 + buy_taker)            # pay ask + taker
+    sell_proceeds = sell_bid * (1 - sell_taker)     # receive bid − taker
+    withdraw_cost_quote = withdraw_base * buy_ask   # flat base fee in quote terms
+
+    net_per_unit = sell_proceeds - buy_cost - withdraw_cost_quote
+    net_bps = net_per_unit / buy_cost * 1e4
+
+    # Executable size is limited by the smaller of the two top-of-book sizes
+    max_size = min(fresh[buy_venue].get("ask_size", 0),
+                   fresh[sell_venue].get("bid_size", 0))
+    est_profit_usd = net_per_unit * max_size if max_size > 0 else 0.0
+
+    return {
+        "symbol": symbol,
+        "buy_venue": buy_venue, "sell_venue": sell_venue,
+        "buy_ask": buy_ask, "sell_bid": sell_bid,
+        "gross_bps": gross_bps, "net_bps": net_bps,
+        "buy_taker_pct": buy_taker * 100, "sell_taker_pct": sell_taker * 100,
+        "withdraw_base": withdraw_base, "withdraw_cost_quote": withdraw_cost_quote,
+        "max_size": max_size, "est_profit_usd": est_profit_usd,
+        "profitable": net_bps >= ARB_MIN_NET_BPS,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -679,6 +778,19 @@ class DataStore:
     def snapshot_bbo(self) -> pd.DataFrame:
         with self.lock:
             return pd.DataFrame([asdict(b) for b in self.bbo.values()]) if self.bbo else pd.DataFrame()
+
+    def quotes_for_symbol(self, symbol: str) -> dict:
+        """Latest BBO per venue for one symbol, shaped for compute_arbitrage."""
+        with self.lock:
+            out = {}
+            for (venue, sym), b in self.bbo.items():
+                if sym == symbol:
+                    out[venue] = {
+                        "bid": b.bid, "ask": b.ask,
+                        "bid_size": b.bid_size, "ask_size": b.ask_size,
+                        "ingest_ts": b.ingest_ts,
+                    }
+            return out
 
     def snapshot_health(self) -> dict:
         with self.lock:
@@ -1331,6 +1443,102 @@ with col_right:
               .round({"price": 2, "qty": 6, "latency_ms": 1}),
             use_container_width=True, hide_index=True,
         )
+
+st.divider()
+
+# ===== Section: Cross-exchange arbitrage monitor ========================== #
+st.header("💱 Cross-exchange arbitrage monitor")
+st.caption(
+    "Best buy-low / sell-high pair per symbol, with the edge shown **gross** "
+    "(raw price gap) and **net of fees** (after taker fees on both legs plus "
+    "the withdrawal cost of moving the asset between venues). Only the net "
+    f"number is real — opportunities clearing **{ARB_MIN_NET_BPS:.0f} bps "
+    f"net** are flagged. Execution risk, withdrawal *time*, and slippage "
+    "beyond top-of-book are not modeled."
+)
+
+now_ms = _now_ms()
+arb_rows = []
+for sym in SYMBOLS:
+    quotes = store.quotes_for_symbol(sym)
+    arb = compute_arbitrage(sym, quotes, VENUE_FEES, now_ms)
+    if arb:
+        arb_rows.append(arb)
+
+if not arb_rows:
+    st.info("Waiting for fresh quotes on at least two venues…")
+else:
+    # Headline metrics for the best opportunity across symbols
+    best = max(arb_rows, key=lambda r: r["net_bps"])
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric(f"Best net edge ({best['symbol']})", f"{best['net_bps']:+.2f} bps",
+              f"gross {best['gross_bps']:+.2f} bps")
+    a2.metric("Buy at", f"{best['buy_venue']}", f"${best['buy_ask']:,.2f}")
+    a3.metric("Sell at", f"{best['sell_venue']}", f"${best['sell_bid']:,.2f}")
+    a4.metric("Est. profit (top-of-book)",
+              f"${best['est_profit_usd']:,.2f}",
+              f"{best['max_size']:.4f} units")
+
+    if best["profitable"]:
+        st.success(
+            f"✅ Net-profitable opportunity on {best['symbol']}: buy "
+            f"{best['buy_venue']} / sell {best['sell_venue']} for "
+            f"{best['net_bps']:.2f} bps after fees."
+        )
+    else:
+        st.warning(
+            f"⚠️ Best gross gap ({best['gross_bps']:+.2f} bps on "
+            f"{best['symbol']}) does NOT survive fees — net "
+            f"{best['net_bps']:+.2f} bps. This is the usual case, and the "
+            "reason naive cross-exchange spread is misleading."
+        )
+
+    # Detailed per-symbol table
+    table = []
+    for r in arb_rows:
+        table.append({
+            "symbol": r["symbol"],
+            "buy @": r["buy_venue"],
+            "buy ask": r["buy_ask"],
+            "sell @": r["sell_venue"],
+            "sell bid": r["sell_bid"],
+            "gross bps": r["gross_bps"],
+            "fees bps": r["gross_bps"] - r["net_bps"],
+            "net bps": r["net_bps"],
+            "max size": r["max_size"],
+            "net profit $": r["est_profit_usd"],
+            "status": "✅ profitable" if r["profitable"] else "— sub-threshold",
+        })
+    arb_df = pd.DataFrame(table).round({
+        "buy ask": 2, "sell bid": 2, "gross bps": 2, "fees bps": 2,
+        "net bps": 2, "max size": 5, "net profit $": 2})
+    st.dataframe(arb_df, use_container_width=True, hide_index=True)
+
+    with st.expander("How the net edge is calculated (and the fee assumptions)"):
+        st.markdown(
+            "For one unit of the base asset:\n\n"
+            "- **Buy cost** = buy-venue ask × (1 + buy taker fee)\n"
+            "- **Sell proceeds** = sell-venue bid × (1 − sell taker fee)\n"
+            "- **Withdrawal cost** = buy-venue withdrawal fee (in base units) "
+            "× buy price — the cost of moving the coin to the sell venue\n"
+            "- **Net edge** = (sell proceeds − buy cost − withdrawal cost) / "
+            "buy cost, in basis points\n\n"
+            "Taker and withdrawal fees are representative public spot fees and "
+            "are editable in `VENUE_FEES` at the top of the file. Your actual "
+            "account tier will differ. Withdrawal *time* (minutes to hours of "
+            "price risk while the transfer confirms) is a real cost this "
+            "model does **not** capture — a production arb screener would."
+        )
+        fee_rows = []
+        for v, f in VENUE_FEES.items():
+            fee_rows.append({
+                "venue": v,
+                "taker %": f["taker"] * 100,
+                "BTC withdraw": f["withdraw"].get("BTC-USD", 0),
+                "ETH withdraw": f["withdraw"].get("ETH-USD", 0),
+            })
+        st.dataframe(pd.DataFrame(fee_rows).round({"taker %": 3}),
+                     use_container_width=True, hide_index=True)
 
 st.divider()
 
